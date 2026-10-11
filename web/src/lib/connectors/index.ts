@@ -61,7 +61,7 @@ export const CONNECTORS: Record<ConnectorId, Connector> = {
   coingecko: {
     label: "CoinGecko (crypto prices)",
     description:
-      "Live cryptocurrency market data from CoinGecko. Fields: name, symbol, price_usd, market_cap, market_cap_rank, change_24h_pct, volume_24h, url. Query: either generic (\"top coins by market cap\") to get the top N by market cap, or specific coin names/symbols separated by spaces/commas (\"bitcoin ethereum solana\").",
+      "Live cryptocurrency market data from CoinGecko. Fields: name, symbol, price_usd, market_cap, market_cap_rank, change_24h_pct, volume_24h, url. Query: either generic (\"top coins by market cap\") to get the top N by market cap, a category (\"top meme coins\", \"defi tokens\", \"stablecoins\", \"layer 2\", \"AI coins\") to get the top N in it, or specific coin names separated by commas (\"bitcoin, usd coin, shiba inu\").",
     run: coingecko,
   },
 };

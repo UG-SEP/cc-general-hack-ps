@@ -171,6 +171,74 @@ const GENERIC_CRYPTO = new RegExp(
     ")$",
   "i",
 );
+// Generic words that can still be part of a coin's name ("USD Coin", "Bitcoin Cash"): kept inside a phrase
+const NAME_PART = /^(coins?|tokens?|usd|eur|gbp|inr|cash|network|protocol|finance)$/i;
+
+// Category words → CoinGecko categories. Without this, "top meme coins" dropped "meme" and listed BTC, ETH, USDT.
+const CATEGORIES: [RegExp, string, string][] = [
+  [/\bmeme ?(coins?|tokens?)?\b|\bmemecoins?\b/i, "meme-token", "meme coins"],
+  [/\bdefi\b|\bdecentrali[sz]ed finance\b/i, "decentralized-finance-defi", "DeFi"],
+  [/\bstable ?coins?\b/i, "stablecoins", "stablecoins"],
+  [/\blayer[- ]?1\b|\bl1s?\b/i, "layer-1", "layer 1"],
+  [/\blayer[- ]?2\b|\bl2s?\b/i, "layer-2", "layer 2"],
+  [/\bai (coins?|tokens?|crypto\w*)\b|\bartificial intelligence\b/i, "artificial-intelligence", "AI"],
+  [/\bnfts?\b/i, "non-fungible-tokens-nft", "NFT"],
+  [/\bgaming (coins?|tokens?|crypto\w*)\b/i, "gaming", "gaming"],
+];
+
+/**
+ * What a crypto query asks for: a category, and the coins it names. Names are phrases split on commas / "and" /
+ * "vs", with filler trimmed from both ends ("price of usd coin" → "usd coin"); `words` are each phrase's
+ * non-generic words, tried one by one when the whole phrase isn't a coin ("bitcoin ethereum solana").
+ */
+function parseCryptoQuery(query: string) {
+  let rest = query;
+  let category: { id: string; label: string } | undefined;
+  for (const [re, id, label] of CATEGORIES)
+    if (re.test(rest)) {
+      category ??= { id, label };
+      rest = rest.replace(re, " ");
+    }
+  const filler = (w: string) => GENERIC_CRYPTO.test(w) && !NAME_PART.test(w);
+  const names = rest
+    .split(/,|&|\/|\band\b|\bvs\.?\b/i)
+    .map((chunk) => {
+      const words = chunk.split(/\s+/).filter(Boolean);
+      while (words.length && filler(words[0])) words.shift();
+      while (words.length && filler(words[words.length - 1])) words.pop();
+      const specific = words.filter((w) => !GENERIC_CRYPTO.test(w));
+      // "coins" alone is no name; "usd coin" (two words, all generic) may be
+      return { phrase: words.join(" "), words: specific, lookup: specific.length > 0 || words.length > 1 };
+    })
+    .filter((n) => n.lookup);
+  return { category, names };
+}
+
+type CoinHit = { id: string; name: string; symbol: string };
+const squashName = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+// a hit counts only when it IS the term (name, id or symbol): the most popular coin merely containing "inu" isn't Shiba Inu
+const exactHit = (term: string, hits: CoinHit[]) => hits.find((h) => [h.name, h.id, h.symbol].some((v) => v && squashName(v) === squashName(term)));
+
+/** Ids for the coins a query names. Search errors propagate: a 429 must reach the fallback, not look like "no match". */
+async function resolveCoins(names: ReturnType<typeof parseCryptoQuery>["names"], search: (term: string) => Promise<CoinHit[]>) {
+  const missed: string[] = [];
+  const perName = await Promise.all(
+    names.slice(0, 5).map(async (n): Promise<string[]> => {
+      const whole = exactHit(n.phrase, await search(n.phrase));
+      if (whole) return [whole.id];
+      // one word that was the whole phrase: already searched
+      if (!n.words.length || (n.words.length === 1 && n.words[0] === n.phrase)) {
+        missed.push(n.phrase);
+        return [];
+      }
+      const found = await Promise.all(n.words.slice(0, 5).map(async (w) => exactHit(w, await search(w))?.id ?? (missed.push(w), null)));
+      return found.filter((x): x is string => !!x);
+    }),
+  );
+  return { ids: [...new Set(perName.flat())], missed };
+}
+
+const noMatchWarning = (missed: string[]) => `No coin matched ${missed.map((m) => `"${m}"`).join(", ")}, so no market data was added for it`;
 
 export async function coingecko(query: string, limit: number): Promise<ConnectorResult> {
   try {
@@ -195,25 +263,26 @@ interface PaprikaTicker {
 }
 
 async function coinpaprika(query: string, limit: number): Promise<ConnectorResult> {
-  const words = query.split(/[\s,]+/).filter(Boolean);
-  const specific = words.filter((w) => !GENERIC_CRYPTO.test(w));
-  let tickers: PaprikaTicker[] = [];
+  const { category, names } = parseCryptoQuery(query);
+  const { ids, missed } = await resolveCoins(names, (term) =>
+    fetchJson<{ currencies?: CoinHit[] }>(`https://api.coinpaprika.com/v1/search?c=currencies&limit=5&q=${encodeURIComponent(term)}`).then(
+      (r) => r.currencies ?? [],
+    ),
+  );
+  const warnings = missed.length ? [noMatchWarning(missed)] : [];
   let url = "https://api.coinpaprika.com/v1/tickers";
-  if (specific.length) {
-    const ids = await Promise.all(
-      specific.slice(0, 10).map((term) =>
-        fetchJson<{ currencies?: { id: string }[] }>(
-          `https://api.coinpaprika.com/v1/search?c=currencies&limit=1&q=${encodeURIComponent(term)}`,
-        )
-          .then((r) => r.currencies?.[0]?.id)
-          .catch(() => undefined),
-      ),
+  let tickers: PaprikaTicker[] = [];
+  if (ids.length) {
+    tickers = (await Promise.all(ids.map((id) => fetchJson<PaprikaTicker>(`https://api.coinpaprika.com/v1/tickers/${id}`).catch(() => null)))).filter(
+      (t): t is PaprikaTicker => !!t,
     );
-    const uniq = [...new Set(ids.filter((x): x is string => !!x))];
-    tickers = (
-      await Promise.all(uniq.map((id) => fetchJson<PaprikaTicker>(`https://api.coinpaprika.com/v1/tickers/${id}`).catch(() => null)))
-    ).filter((t): t is PaprikaTicker => !!t);
-    url = `https://api.coinpaprika.com/v1/tickers/${uniq.join(",")}`;
+    url = `https://api.coinpaprika.com/v1/tickers/${ids.join(",")}`;
+  } else if (missed.length) {
+    // the user named coins and none matched: the top list instead would look like the answer
+    return { items: [], url, warnings };
+  } else if (category) {
+    // CoinPaprika has no category filter, and its overall top list would pass for "top meme coins"
+    return { items: [], url, warnings: [`The backup market data source can't filter by ${category.label}, so it added nothing`] };
   } else {
     const all = await fetchJson<PaprikaTicker[]>(url);
     tickers = (Array.isArray(all) ? all : []).filter((t) => t.rank > 0).sort((a, b) => a.rank - b.rank);
@@ -240,28 +309,20 @@ async function coinpaprika(query: string, limit: number): Promise<ConnectorResul
       published_at: t.last_updated,
     };
   });
-  return { items, url };
+  return { items, url, warnings };
 }
 
 async function coingeckoPrimary(query: string, limit: number): Promise<ConnectorResult> {
-  const words = query.split(/[\s,]+/).filter(Boolean);
-  const specific = words.filter((w) => !GENERIC_CRYPTO.test(w));
-  let ids: string[] = [];
-  if (specific.length) {
-    // Resolve each named coin via /search (take best match per term).
-    const results = await Promise.all(
-      specific.slice(0, 10).map((term) =>
-        fetchJson<{ coins?: { id: string }[] }>(
-          `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(term)}`,
-        ).catch(() => ({ coins: [] })),
-      ),
-    );
-    ids = [...new Set(results.map((r) => r.coins?.[0]?.id).filter((x): x is string => !!x))];
-  }
+  const { category, names } = parseCryptoQuery(query);
+  const { ids, missed } = await resolveCoins(names, (term) =>
+    fetchJson<{ coins?: CoinHit[] }>(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(term)}`).then((r) => (r.coins ?? []).slice(0, 10)),
+  );
+  const warnings = missed.length ? [noMatchWarning(missed)] : [];
+  const base = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&page=1";
+  if (!ids.length && missed.length) return { items: [], url: base, warnings };
+  // named coins win over a category ("meme coins like pepe" → pepe)
   const perPage = Math.min(Math.max(ids.length || limit, 1), 250);
-  const url =
-    `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1` +
-    (ids.length ? `&ids=${ids.join(",")}` : "");
+  const url = `${base}&per_page=${perPage}` + (ids.length ? `&ids=${ids.join(",")}` : category ? `&category=${category.id}` : "");
   const data = await fetchJson<CgMarket[]>(url);
   const items: RawItem[] = (Array.isArray(data) ? data : []).slice(0, limit).map((c) => {
     const pageUrl = `https://www.coingecko.com/en/coins/${c.id}`;
@@ -279,9 +340,10 @@ async function coingeckoPrimary(query: string, limit: number): Promise<Connector
         change_24h_pct: c.price_change_percentage_24h,
         volume_24h: c.total_volume,
         url: pageUrl,
+        ...(category && !ids.length ? { category: category.label } : {}),
       },
       published_at: c.last_updated,
     };
   });
-  return { items, url };
+  return { items, url, warnings };
 }
