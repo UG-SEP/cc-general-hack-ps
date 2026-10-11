@@ -132,7 +132,8 @@ export function heuristicPlan(prompt: string): WorkflowPlan {
   let entity = "record";
   let dedupe: string[] = ["name", "url"];
 
-  if (/\b(job|jobs|hiring|developer|engineer|designer|intern|role|vacanc|opening)/.test(p)) {
+  // whole words: "internet companies" isn't "intern", and "developer tools on GitHub" is a repo search
+  if (/\b(jobs?|hiring|developers?(?! (tools?|platforms?|experience|productivity|communit\w*|relations|portals?|docs))|engineers?|designers?|interns?|internships?|roles?|vacanc(y|ies)|openings?)\b/.test(p)) {
     entity = "job posting";
     const q = keywords(prompt, 3);
     sources.push(
@@ -152,7 +153,7 @@ export function heuristicPlan(prompt: string): WorkflowPlan {
       f("apply_url", "url", "Where to apply"),
     ];
     dedupe = ["title", "company"];
-  } else if (/\b(crypto|coin|bitcoin|ethereum|token|market cap)/.test(p)) {
+  } else if (/\b(crypto\w*|coins?|bitcoin|ethereum|tokens?|market cap)\b/.test(p)) {
     entity = "cryptocurrency";
     sources.push({ connector: "coingecko", query: kw, limit: 40, reason: "Live market data API" });
     fields = [

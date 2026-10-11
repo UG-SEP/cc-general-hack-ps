@@ -1,39 +1,33 @@
 import type { ConnectorResult, RawItem } from "../types";
 import { clip, fetchJson, htmlToText, queryWords } from "./http";
 
-/** Rank items by how many query words appear in their haystack; drop zero-score items if query has words. */
-function rankByQuery<T>(items: T[], query: string, hay: (t: T) => string): T[] {
-  const words = queryWords(query);
-  if (!words.length) return items;
-  const scored = items
-    .map((it, i) => {
-      const h = hay(it).toLowerCase();
-      const score = words.reduce((s, w) => s + (h.includes(w) ? 1 : 0), 0);
-      return { it, score, i };
-    })
-    .filter((x) => x.score > 0);
-  scored.sort((a, b) => b.score - a.score || a.i - b.i);
-  return scored.map((x) => x.it);
-}
-
 // Seniority and role words appear in most postings, so they can't be the only reason a job matches.
 const GENERIC = new Set(["senior", "junior", "mid", "lead", "staff", "principal", "head", "engineer", "engineering", "developer", "development", "manager", "specialist", "intern", "software", "full", "time", "part", "contract", "freelance"]);
 
+// Words about the listing, not the job: a posting rarely says "salary" or "this week", so requiring them dropped everything
+const NOISE = new Set(["salary", "salaries", "pay", "compensation", "posted", "this", "week", "weeks", "month", "today", "latest", "recent", "new", "info", "information", "details", "hiring", "openings", "opening", "opportunities", "vacancies", "top", "best", "worldwide", "anywhere"]);
+// boards write a skill differently from the query: "go" jobs say "Golang"
+const ALIASES: Record<string, string[]> = { go: ["golang"], golang: ["go"], js: ["javascript"], ts: ["typescript"], k8s: ["kubernetes"] };
+
 /**
- * Keep jobs that mention at least half the query words, best first (all words, title hits count most). Tags and
- * descriptions are weak on their own: boards tag freely (a "Quality Dispense Technician" tagged golang) and
- * descriptions list whole stacks. So a job also needs a specific word (not "senior", "engineer"...) in its title,
- * or in both its tags and description.
+ * Keep jobs that mention the query's specific words (skills, places: not "senior", "engineer"): all of them when
+ * there are one or two, else all but one; best first, title hits counting most. Tags and descriptions are weak on
+ * their own: boards tag freely (a "Quality Dispense Technician" tagged golang) and descriptions list whole stacks.
+ * So a job also needs a specific word in its title, or in both its tags and description.
  */
 function matchJobs<T>(items: T[], query: string, parts: (t: T) => { title: string; tags: string; text?: string }): T[] {
-  const words = queryWords(query);
+  const words = queryWords(query).filter((w) => !NOISE.has(w));
   if (!words.length) return items;
   const specific = words.some((w) => !GENERIC.has(w)) ? words.filter((w) => !GENERIC.has(w)) : words;
   const squash = (s: string) => s.replace(/[-\s]+/g, "");
   // "front-end" / "front end" match "frontend"; only for longer words, where joining can't fake a match
   // short words match whole words only: "ai" mustn't hit "maintenance", nor "go" hit "google"
-  const short = new Map(words.filter((w) => w.length <= 3).map((w) => [w, new RegExp(`(^|[^a-z0-9])${w.replace(/[+#.]/g, "\\$&")}(?![a-z0-9])`)]));
-  const has = (hay: string, w: string) => short.get(w)?.test(hay) ?? (hay.includes(w) || (w.length >= 5 && squash(hay).includes(w)));
+  const forms = (w: string) => [w, ...(ALIASES[w] ?? [])];
+  const short = new Map(
+    [...new Set(words.flatMap(forms))].filter((w) => w.length <= 3).map((w) => [w, new RegExp(`(^|[^a-z0-9])${w.replace(/[+#.]/g, "\\$&")}(?![a-z0-9])`)]),
+  );
+  const hasForm = (hay: string, w: string) => short.get(w)?.test(hay) ?? (hay.includes(w) || (w.length >= 5 && squash(hay).includes(w)));
+  const has = (hay: string, w: string) => forms(w).some((f) => hasForm(hay, f));
   const scored = items.map((it, i) => {
     const p = parts(it);
     const [title, tags, text] = [p.title.toLowerCase(), p.tags.toLowerCase(), (p.text ?? "").toLowerCase()];
@@ -42,13 +36,14 @@ function matchJobs<T>(items: T[], query: string, parts: (t: T) => { title: strin
     let score = 0;
     for (const w of words) {
       const [inTitle, inTags, inText] = [has(title, w), has(tags, w), has(text, w)];
-      if (inTitle || inTags || inText) found++;
+      if (specific.includes(w) && (inTitle || inTags || inText)) found++;
       if (specific.includes(w) && (inTitle || (inTags && inText))) strong = true;
       score += (inTitle ? 3 : 0) + (inTags ? 1 : 0) + (inText ? 1 : 0);
     }
     return { it, i, found, strong, score };
   });
-  const need = Math.ceil(words.length / 2);
+  // half the words let "backend developer berlin" keep every Berlin developer job; one miss allowed from three on
+  const need = specific.length <= 2 ? specific.length : specific.length - 1;
   return scored
     .filter((x) => x.strong && x.found >= need)
     .sort((a, b) => b.found - a.found || b.score - a.score || a.i - b.i)
@@ -105,7 +100,12 @@ export async function remotiveJobs(query: string, limit: number): Promise<Connec
   }
   // Remotive's search also returns jobs that don't mention the query anywhere; drop those instead of padding with them
   const desc = new Map(jobs.map((j) => [j, htmlToText(j.description)]));
-  jobs = matchJobs(jobs, q, (j) => ({ title: j.title, tags: `${(j.tags ?? []).join(" ")} ${j.category ?? ""}`, text: desc.get(j) }));
+  jobs = matchJobs(jobs, q, (j) => ({
+    title: j.title,
+    // location too, so "react developer europe" can match a job open to Europe
+    tags: `${(j.tags ?? []).join(" ")} ${j.category ?? ""} ${j.candidate_required_location ?? ""}`,
+    text: desc.get(j),
+  }));
   const items: RawItem[] = jobs.slice(0, limit).map((j) => {
     const text = desc.get(j) ?? "";
     const fields = {
@@ -145,6 +145,14 @@ interface ArbeitnowJob {
   created_at: number;
 }
 
+// same rule as the other boards: any one word used to be enough, so "backend developer berlin" kept every developer job
+const arbeitnowText = new WeakMap<ArbeitnowJob, string>(); // matched after every page: convert each description once
+const matchArbeitnow = (jobs: ArbeitnowJob[], query: string) =>
+  matchJobs(jobs, query, (j) => {
+    if (!arbeitnowText.has(j)) arbeitnowText.set(j, htmlToText(j.description));
+    return { title: j.title, tags: `${j.tags.join(" ")} ${j.company_name} ${j.location}`, text: arbeitnowText.get(j) };
+  });
+
 export async function arbeitnowJobs(query: string, limit: number): Promise<ConnectorResult> {
   const base = "https://www.arbeitnow.com/api/job-board-api";
   const all: ArbeitnowJob[] = [];
@@ -157,10 +165,9 @@ export async function arbeitnowJobs(query: string, limit: number): Promise<Conne
     const batch = d.data ?? [];
     all.push(...batch);
     if (!batch.length) break;
-    const matched = rankByQuery(all, query, (j) => `${j.title} ${j.company_name} ${j.tags.join(" ")} ${j.location}`);
-    if (matched.length >= limit) break;
+    if (matchArbeitnow(all, query).length >= limit) break;
   }
-  const ranked = rankByQuery(all, query, (j) => `${j.title} ${j.company_name} ${j.tags.join(" ")} ${j.location} ${j.remote ? "remote" : ""}`);
+  const ranked = matchArbeitnow(all, query);
   const items: RawItem[] = ranked.slice(0, limit).map((j) => {
     const posted = j.created_at ? new Date(j.created_at * 1000).toISOString() : undefined;
     return {
@@ -216,10 +223,16 @@ export async function remoteokJobs(query: string, limit: number): Promise<Connec
   }));
   const items: RawItem[] = ranked.slice(0, limit).map((j) => {
     const pageUrl = j.url || `https://remoteok.com/remote-jobs/${j.slug ?? j.id}`;
+    // one end missing is "from" / "up to", never "$? - $120000"
+    const usd = (n: number) => `$${n.toLocaleString("en-US")}`;
     const salary =
-      j.salary_min || j.salary_max
-        ? `$${j.salary_min ?? "?"} - $${j.salary_max ?? "?"}`
-        : null;
+      j.salary_min && j.salary_max
+        ? `${usd(j.salary_min)} - ${usd(j.salary_max)}`
+        : j.salary_max
+          ? `up to ${usd(j.salary_max)}`
+          : j.salary_min
+            ? `from ${usd(j.salary_min)}`
+            : null;
     return {
       source: "remoteok_jobs",
       url: pageUrl,
